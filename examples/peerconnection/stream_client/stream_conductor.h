@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 
+#include "api/data_channel_interface.h"
 #include "api/environment/environment.h"
 #include "api/jsep.h"
 #include "api/peer_connection_interface.h"
@@ -31,6 +32,7 @@ namespace stream_client {
 
 class StreamConductor : public webrtc::PeerConnectionObserver,
                         public webrtc::CreateSessionDescriptionObserver,
+                        public webrtc::DataChannelObserver,
                         public PeerConnectionClientObserver {
  public:
   StreamConductor(const webrtc::Environment& env,
@@ -65,7 +67,7 @@ class StreamConductor : public webrtc::PeerConnectionObserver,
   void OnRemoveTrack(
       webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) override {}
   void OnDataChannel(
-      webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override {}
+      webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override;
   void OnRenegotiationNeeded() override {}
   void OnIceConnectionChange(
       webrtc::PeerConnectionInterface::IceConnectionState new_state) override;
@@ -73,6 +75,10 @@ class StreamConductor : public webrtc::PeerConnectionObserver,
       webrtc::PeerConnectionInterface::IceGatheringState new_state) override {}
   void OnIceCandidate(const webrtc::IceCandidate* candidate) override;
   void OnIceConnectionReceivingChange(bool receiving) override {}
+
+  // DataChannelObserver
+  void OnStateChange() override {}
+  void OnMessage(const webrtc::DataBuffer& buffer) override;
 
   // PeerConnectionClientObserver
   void OnSignedIn() override;
@@ -91,6 +97,7 @@ class StreamConductor : public webrtc::PeerConnectionObserver,
   bool CreatePeerConnection();
   void DeletePeerConnection();
   void AddVideoTrack();
+  void ScheduleBandwidthStats();
   void SendMessage(const std::string& json_object);
   void ProcessPendingMessages();
 
@@ -114,8 +121,10 @@ class StreamConductor : public webrtc::PeerConnectionObserver,
   std::unique_ptr<webrtc::Thread> signaling_thread_;
 
   webrtc::scoped_refptr<CustomVideoSource> video_source_;
+  webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel_;
 
   std::deque<std::string*> pending_messages_;
+  bool stats_running_ = false;
 };
 
 }  // namespace stream_client

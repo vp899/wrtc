@@ -32,6 +32,10 @@ CustomVideoSource::~CustomVideoSource() {
   Stop();
 }
 
+void CustomVideoSource::SetCirclePosition(int x, int y) {
+  frame_generator_->SetCirclePosition(x, y);
+}
+
 void CustomVideoSource::Start() {
   if (running_.load()) return;
 
@@ -69,10 +73,9 @@ void CustomVideoSource::RemoveSink(
 void CustomVideoSource::CaptureThreadFunc() {
   RTC_LOG(LS_INFO) << "Capture thread started";
 
-  // Use steady clock for accurate timing
   auto start_time = std::chrono::steady_clock::now();
   int64_t frame_number = 0;
-  const int64_t frame_interval_us = 1000000 / fps_;  // microseconds per frame
+  const int64_t frame_interval_us = 1000000 / fps_;
 
   while (running_.load()) {
     auto now = std::chrono::steady_clock::now();
@@ -81,11 +84,9 @@ void CustomVideoSource::CaptureThreadFunc() {
             .count();
     int64_t elapsed_ms = elapsed_us / 1000;
 
-    // Generate the frame
     webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
         frame_generator_->GenerateFrame(elapsed_ms);
 
-    // Create VideoFrame
     webrtc::VideoFrame frame =
         webrtc::VideoFrame::Builder()
             .set_video_frame_buffer(buffer)
@@ -93,7 +94,6 @@ void CustomVideoSource::CaptureThreadFunc() {
             .set_timestamp_us(elapsed_us)
             .build();
 
-    // Deliver frame to sink
     {
       webrtc::MutexLock lock(&mutex_);
       if (sink_) {
@@ -103,14 +103,12 @@ void CustomVideoSource::CaptureThreadFunc() {
 
     frame_number++;
 
-    // Calculate next frame time and sleep
     int64_t next_frame_us = frame_number * frame_interval_us;
     int64_t sleep_us = next_frame_us - elapsed_us;
 
     if (sleep_us > 0) {
       std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
     } else {
-      // We're behind, log warning occasionally
       if (frame_number % (fps_ * 5) == 0) {
         RTC_LOG(LS_WARNING) << "Frame generation running behind by "
                             << (-sleep_us / 1000) << "ms";

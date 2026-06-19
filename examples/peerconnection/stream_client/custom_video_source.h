@@ -2,7 +2,7 @@
  *  Copyright (c) 2024 The WebRTC Project Authors. All rights reserved.
  *
  *  Custom video track source that generates YUV420 frames with animation.
- *  Feeds frames into WebRTC at a specified frame rate.
+ *  Supports remote circle position control via SetCirclePosition().
  */
 
 #ifndef EXAMPLES_PEERCONNECTION_STREAM_CLIENT_CUSTOM_VIDEO_SOURCE_H_
@@ -23,18 +23,17 @@
 
 namespace stream_client {
 
-// A custom VideoTrackSource that generates animated YUV420 frames.
-// Runs a capture thread that produces frames at the specified FPS.
 class CustomVideoSource : public webrtc::VideoTrackSource {
  public:
   CustomVideoSource(int width, int height, int fps);
   ~CustomVideoSource() override;
 
-  // Start/stop frame generation.
   void Start();
   void Stop();
 
-  // VideoTrackSource implementation
+  // Set the draggable circle position (called from DataChannel).
+  void SetCirclePosition(int x, int y);
+
   bool is_screencast() const override { return false; }
   std::optional<bool> needs_denoising() const override { return false; }
 
@@ -42,7 +41,6 @@ class CustomVideoSource : public webrtc::VideoTrackSource {
   webrtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
     return this;
   }
-  // VideoSourceInterface implementation
   void AddOrUpdateSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
                        const webrtc::VideoSinkWants& wants) override;
   void RemoveSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink) override;

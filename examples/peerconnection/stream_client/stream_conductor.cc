@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <cstring>
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -43,12 +44,14 @@
 #include "media/base/media_engine.h"
 #include "media/engine/webrtc_video_engine.h"
 #include "pc/media_factory.h"
+#include "api/stats/rtcstats_objects.h"
 #include "json/reader.h"
 #include "json/value.h"
 #include "json/writer.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/strings/json.h"
+#include "rtc_base/time_utils.h"
 
 namespace stream_client {
 
@@ -60,6 +63,50 @@ const char kSessionDescriptionTypeName[] = "type";
 const char kSessionDescriptionSdpName[] = "sdp";
 const char kStreamId[] = "stream_client_video";
 const char kVideoLabel[] = "stream_video_track";
+const int kStatsIntervalMs = 2000;  // Stats collection interval
+
+// ====================================================================
+// Bandwidth stats observer — prints bandwidth info periodically
+// ====================================================================
+class BandwidthStatsObserver : public webrtc::RTCStatsCollectorCallback {
+ public:
+  static webrtc::scoped_refptr<BandwidthStatsObserver> Create() {
+    return webrtc::make_ref_counted<BandwidthStatsObserver>();
+  }
+
+  void OnStatsDelivered(
+      const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report)
+      override {
+    double available_bw = 0;
+    double rtt = 0;
+    uint64_t bytes_sent = 0;
+
+    for (const auto& stat : *report) {
+      if (std::strcmp(stat.type(), "candidate-pair") == 0) {
+        const auto& cp =
+            stat.cast_to<webrtc::RTCIceCandidatePairStats>();
+        if (cp.state.has_value() && *cp.state == "succeeded") {
+          if (cp.available_outgoing_bitrate.has_value())
+            available_bw = *cp.available_outgoing_bitrate;
+          if (cp.current_round_trip_time.has_value())
+            rtt = *cp.current_round_trip_time;
+          if (cp.bytes_sent.has_value())
+            bytes_sent = *cp.bytes_sent;
+        }
+      }
+      if (std::strcmp(stat.type(), "outbound-rtp") == 0) {
+        // Use outbound-rtp bytes_sent as actual sent data
+      }
+    }
+
+    double avail_kbps = available_bw / 1000.0;
+    double rtt_ms = rtt * 1000.0;
+
+    printf("[stream_client] BW | avail: %.0f kbps | RTT: %.0f ms | bytes_sent: %llu\n",
+           avail_kbps, rtt_ms, (unsigned long long)bytes_sent);
+    fflush(stdout);
+  }
+};
 
 // ====================================================================
 // Dummy voice engine — implements VoiceEngineInterface with no-ops.
@@ -260,6 +307,7 @@ void StreamConductor::ConnectToServer(const std::string& server, int port) {
 
 void StreamConductor::Close() {
   RTC_LOG(LS_INFO) << "StreamConductor closing";
+  stats_running_ = false;
 
   if (video_source_) {
     video_source_->Stop();
@@ -309,12 +357,35 @@ bool StreamConductor::CreatePeerConnection() {
 }
 
 void StreamConductor::DeletePeerConnection() {
+  if (data_channel_) {
+    data_channel_->UnregisterObserver();
+    data_channel_ = nullptr;
+  }
   peer_connection_ = nullptr;
   peer_connection_factory_ = nullptr;
   video_source_ = nullptr;
   peer_id_ = -1;
   remote_description_set_ = false;
   pending_ice_candidates_.clear();
+}
+
+void StreamConductor::OnDataChannel(
+    webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) {
+  printf("[stream_client] DataChannel received: %s\n", channel->label().c_str()); fflush(stdout);
+  data_channel_ = channel;
+  data_channel_->RegisterObserver(this);
+}
+
+void StreamConductor::OnMessage(const webrtc::DataBuffer& buffer) {
+  std::string msg(buffer.data.data<char>(), buffer.data.size());
+  size_t comma = msg.find(',');
+  if (comma != std::string::npos) {
+    int x = std::atoi(msg.c_str());
+    int y = std::atoi(msg.c_str() + comma + 1);
+    if (video_source_) {
+      video_source_->SetCirclePosition(x, y);
+    }
+  }
 }
 
 void StreamConductor::AddVideoTrack() {
@@ -338,6 +409,23 @@ void StreamConductor::AddVideoTrack() {
   printf("[stream_client] Video track added, frame generation started\n"); fflush(stdout);
   RTC_LOG(LS_INFO) << "Video track added and frame generation started ("
                     << width_ << "x" << height_ << " @ " << fps_ << "fps)";
+
+  // Start periodic bandwidth stats collection
+  stats_running_ = true;
+  ScheduleBandwidthStats();
+}
+
+void StreamConductor::ScheduleBandwidthStats() {
+  if (!peer_connection_ || !signaling_thread_ || !stats_running_) return;
+
+  signaling_thread_->PostDelayedTask(
+      [this]() {
+        if (!peer_connection_ || !stats_running_) return;
+        auto observer = BandwidthStatsObserver::Create();
+        peer_connection_->GetStats(observer.get());
+        ScheduleBandwidthStats();
+      },
+      webrtc::TimeDelta::Millis(kStatsIntervalMs));
 }
 
 void StreamConductor::SendMessage(const std::string& json_object) {

@@ -424,6 +424,17 @@ function startCall() {
   // Add transceiver to receive video
   pc.addTransceiver('video', { direction: 'recvonly' });
 
+  // DataChannel for remote control (will be created by sender,
+  // but we also create one to ensure it exists)
+  var dc = pc.createDataChannel('control');
+  dc.onopen = function() { log('DataChannel opened', 'recv'); setupMouseDrag(dc); };
+  dc.onclose = function() { log('DataChannel closed', 'info'); };
+
+  pc.ondatachannel = function(e) {
+    log('DataChannel received: ' + e.channel.label, 'recv');
+    e.channel.onopen = function() { log('DataChannel opened', 'recv'); setupMouseDrag(e.channel); };
+  };
+
   pc.createOffer()
     .then(function(offer) {
       log('Offer created, setting local description...', 'send');
@@ -437,6 +448,46 @@ function startCall() {
       log('Offer failed: ' + e, 'error');
       setStatus('Failed: ' + e, 'error');
     });
+}
+
+// ============ Mouse Drag Control ============
+var dragChannel = null;
+var isDragging = false;
+
+function setupMouseDrag(channel) {
+  dragChannel = channel;
+  var video = document.getElementById('remoteVideo');
+
+  function sendPos(e) {
+    if (!dragChannel || dragChannel.readyState !== 'open') return;
+    var rect = video.getBoundingClientRect();
+    // Map mouse position to 320x240 video coordinates
+    var scaleX = 320 / rect.width;
+    var scaleY = 240 / rect.height;
+    var vx = Math.round((e.clientX - rect.left) * scaleX);
+    var vy = Math.round((e.clientY - rect.top) * scaleY);
+    vx = Math.max(0, Math.min(320, vx));
+    vy = Math.max(0, Math.min(240, vy));
+    dragChannel.send(vx + ',' + vy);
+  }
+
+  video.addEventListener('mousedown', function(e) {
+    isDragging = true;
+    sendPos(e);
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', function(e) {
+    if (!isDragging) return;
+    sendPos(e);
+    e.preventDefault();
+  });
+
+  document.addEventListener('mouseup', function() {
+    isDragging = false;
+  });
+
+  log('Mouse drag control enabled (drag circle to move it)', 'info');
 }
 
 // ============ UI ============

@@ -1,312 +1,165 @@
-# stream_client - WebRTC 视频流发送端
+# stream_client — WebRTC 弱网视频推流工具
 
-## 概述
+基于 WebRTC 的无头视频发送端，生成动画 YUV420 帧并通过 H264 编码推流到浏览器接收端。支持弱网模拟环境下的 STUN 穿透。
 
-`stream_client` 是一个无头 (headless) 的 WebRTC 视频发送端程序，它：
+## 功能
 
-1. **生成 YUV420p 动画帧**（320×240 @ 30fps）：
-   - 左上角显示时间戳（格式：`HH:MM:SS:mmm`，从 `00:00:00:000` 开始）
-   - 一个 100×100 的绿色矩形，水平方向每帧移动 1 像素，碰到边缘反弹
+- 自动生成 320x240 @ 30fps 的 YUV420 动画帧
+- 每帧叠加时间戳（HH:MM:SS:mmm 格式）
+- 100x100 绿色矩形反弹动画
+- WebRTC 内置 OpenH264 编码
+- 通过 peerconnection_server 进行信令
+- 浏览器端实时显示延迟、带宽、帧率等指标
 
-2. **使用 WebRTC 内置的 OpenH264 编码器** 将每一帧编码为 H264
-
-3. **通过 `peerconnection_server` 信令服务器** 与接收端（Chrome 浏览器）交换 SDP 和 ICE 候选
-
-## 架构
+## 文件说明
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    VMware Ubuntu                             │
-│                                                             │
-│  ┌──────────────────┐    ┌──────────────────────────────┐   │
-│  │ peerconnection   │    │        stream_client          │   │
-│  │     _server      │◄───│                              │   │
-│  │   (port 8888)    │    │  FrameGenerator (320x240)    │   │
-│  │                  │    │       ↓                      │   │
-│  │  信令服务器       │    │  CustomVideoSource (30fps)   │   │
-│  │                  │    │       ↓                      │   │
-│  │  - sign_in       │    │  WebRTC PeerConnection       │   │
-│  │  - wait          │    │       ↓                      │   │
-│  │  - message       │    │  OpenH264 Encoder            │   │
-│  └──────────────────┘    │       ↓                      │   │
-│         ▲                │  RTP → 发送到接收端            │   │
-│         │                └──────────────────────────────┘   │
-│         │ 信令 (HTTP)                                       │
-└─────────┼───────────────────────────────────────────────────┘
-          │
-          │  网络
-          │
-┌─────────┼───────────────────────────────────────────────────┐
-│         │           Windows 主机                             │
-│         ▼                                                   │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │              Chrome 浏览器                            │   │
-│  │                                                      │   │
-│  │  receiver.html                                       │   │
-│  │  - 连接信令服务器                                      │   │
-│  │  - 发送 SDP Offer                                    │   │
-│  │  - 接收 H264 视频流                                   │   │
-│  │  - 播放动画视频                                       │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+stream_client/
+├── main.cc                  # 入口，命令行参数解析
+├── stream_conductor.cc      # WebRTC 核心逻辑（视频工厂、PeerConnection、ICE）
+├── stream_conductor.h       # 头文件
+├── custom_video_source.cc   # 自定义视频源（YUV 帧生成）
+├── custom_video_source.h
+├── frame_generator.cc       # 动画帧生成器（时间戳 + 弹跳矩形）
+├── frame_generator.h
+├── peer_connection_client.cc # 信令客户端（与 peerconnection_server 通信）
+├── peer_connection_client.h
+├── defaults.cc / .h         # 默认配置
+└── receiver.html            # 浏览器接收端（含延迟/带宽叠加层）
 ```
-
-## 前置条件
-
-### Ubuntu (VMware)
-- 已编译的 WebRTC 项目（包含 `peerconnection_server`）
-- OpenH264 库（WebRTC 自带）
-- GCC/G++ 编译器
-
-### Windows 主机
-- Chrome 浏览器（版本 72+，支持 WebRTC Unified Plan）
 
 ## 编译
 
-### 方法 1：在 WebRTC 源码树中编译（推荐）
+```bash
+cd ~/rtc/buildwebrtc/src
+ninja -C out/demo stream_client
+```
 
-1. 将 `stream_client` 目录复制到 WebRTC 源码树的 `examples/peerconnection/` 下：
-   ```bash
-   cp -r stream_client/ /path/to/webrtc/src/examples/peerconnection/
-   ```
+## 运行
 
-2. 将本项目附带的 `examples/BUILD.gn` 替换到 WebRTC 源码树（或手动将 `stream_client` target 合并进去）：
-   ```bash
-   cp examples/BUILD.gn /path/to/webrtc/src/examples/BUILD.gn
-   ```
-
-3. 使用 GN 生成构建文件：
-   ```bash
-   cd /path/to/webrtc/src
-   gn gen out/Release --args='is_debug=false rtc_use_h264=true'
-   ```
-
-4. 编译：
-   ```bash
-   ninja -C out/Release examples:stream_client
-   ```
-
-### 方法 2：独立编译（CMake）
-
-如果不想在 WebRTC 源码树中编译，可以使用 CMake：
+### 1. 启动信令服务器
 
 ```bash
-cd examples/peerconnection/stream_client
-mkdir build && cd build
-cmake .. -DWEBRTC_ROOT=/path/to/webrtc/src
-make -j$(nproc)
+./out/demo/peerconnection_server
 ```
 
-## 部署和运行
-
-### 步骤 1：在 Ubuntu 上启动信令服务器
+### 2. 启动 STUN 服务器（弱网 namespace 环境必需）
 
 ```bash
-# 进入 WebRTC 编译输出目录
-cd /path/to/webrtc/src/out/Release
-
-# 启动 peerconnection_server，监听 8888 端口
-./peerconnection_server --port=8888
+./bin/turnserver --listening-ip=<HOST_IP> --listening-port=3478 \
+  --no-tls --no-dtls --stun-only --cli-password=test123
 ```
 
-你会看到：
-```
-Server listening on port 8888
-```
-
-### 步骤 2：在 Ubuntu 上启动 stream_client
+### 3. 创建弱网环境（可选）
 
 ```bash
-# 在另一个终端
-cd /path/to/webrtc/src/out/Release
-
-# 启动 stream_client
-./stream_client --server=127.0.0.1 --port=8888 --id=stream_001
+sudo ./setup_network.sh
 ```
 
-**参数说明：**
+脚本自动配置：
+- network namespace（ns-sender）
+- veth pair + NAT
+- FORWARD/SNAT 规则（STUN 支持）
+- tc 弱网损伤（带宽/延迟/丢包）
+
+清理环境：`sudo ./setup_network.sh --clean`
+
+### 4. 启动 stream_client
+
+**直接运行（无 namespace）：**
+
+```bash
+./out/demo/stream_client --server=<HOST_IP> --port=8888 --id=stream_001
+```
+
+**在 namespace 中运行（弱网环境）：**
+
+```bash
+sudo ip netns exec ns-sender ./out/demo/stream_client \
+  --server=<HOST_IP> --port=8888 --id=stream_001 \
+  --stun=stun:<HOST_IP>:3478
+```
+
+### 5. 浏览器接收端
+
+用 Chrome 打开 `receiver.html`，配置：
+- Server: `http://<HOST_IP>:8888`
+- Stream ID: `stream_001`
+- STUN: `stun:<HOST_IP>:3478`（弱网环境必需）
+
+点击 Connect 即可接收视频流。
+
+## 命令行参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--server` | `localhost` | 信令服务器地址 |
-| `--port` | `8888` | 信令服务器端口 |
-| `--id` | `stream_001` | 流 ID（接收端需要用这个 ID 连接）|
-| `--width` | `320` | 视频宽度 |
-| `--height` | `240` | 视频高度 |
-| `--fps` | `30` | 帧率 |
+| `--server` | localhost | peerconnection_server 地址 |
+| `--port` | 8888 | 信令服务器端口 |
+| `--id` | stream_001 | 流 ID（固定标识） |
+| `--stun` | （空） | STUN 服务器 URI，如 `stun:192.168.1.100:3478` |
+| `--width` | 320 | 视频宽度 |
+| `--height` | 240 | 视频高度 |
+| `--fps` | 30 | 帧率 |
 
-你会看到：
-```
-=== stream_client ===
-Server:     127.0.0.1:8888
-Stream ID:  stream_001
-Resolution: 320x240 @ 30fps
-Codec:      H264 (OpenH264)
+## 浏览器端叠加层指标
 
-Press Ctrl+C to stop.
+| 指标 | 说明 |
+|------|------|
+| RTT | WebRTC RTCP 报告的往返延迟 |
+| One-way delay | RTT / 2 单向延迟估算 |
+| Avg(N) | 过去 N 个采样的平均单向延迟 |
+| Min / Max | 滑动窗口内的最小/最大延迟 |
+| Actual BW | 实际接收带宽（从 bytesReceived 计算） |
+| Avail BW | WebRTC 估算的可用带宽 |
+| Frames | 已解码帧数 |
+| FPS | 当前帧率 |
 
-Connecting to signaling server 127.0.0.1:8888...
-Signed in to server as 'stream_001'
-Waiting for a receiver to connect...
-```
+## stream_client 终端日志
 
-### 步骤 3：在 Windows Chrome 中打开接收页面
-
-**方法 A：直接打开 HTML 文件**
-
-1. 将 `receiver.html` 复制到 Windows 主机
-2. 用 Chrome 打开 `receiver.html`
-3. 在 "Server" 输入框填入：`http://<Ubuntu_IP>:8888`（例如 `http://192.168.1.100:8888`）
-4. 在 "Stream ID" 输入框填入：`stream_001`（必须与 `--id` 参数一致）
-5. 点击 "Connect"
-
-**方法 B：通过 URL 参数自动连接**
-
-在 Chrome 地址栏输入：
-```
-file:///path/to/receiver.html?server=http://192.168.1.100:8888&id=stream_001&auto=1
-```
-
-**方法 C：在 Ubuntu 上托管 HTML（可选）**
-
-可以使用 Python 简单 HTTP 服务器托管：
-```bash
-cd /path/to/stream_client
-python3 -m http.server 8080
-```
-
-然后在 Chrome 中访问：
-```
-http://<Ubuntu_IP>:8080/receiver.html?server=http://<Ubuntu_IP>:8888&id=stream_001&auto=1
-```
-
-### 步骤 4：观看视频
-
-连接成功后，Chrome 浏览器中会显示：
-- 黑色背景上
-- 左上角：递增的时间戳（白色）
-- 中间：一个水平弹跳的绿色矩形
-
-## 信令流程详解
+每 2 秒输出带宽统计：
 
 ```
-stream_client          peerconnection_server        Chrome (receiver)
-     │                         │                          │
-     │  GET /sign_in?stream_001│                          │
-     │────────────────────────►│                          │
-     │  200 OK (peer_id=1)     │                          │
-     │◄────────────────────────│                          │
-     │                         │                          │
-     │  GET /wait?peer_id=1    │                          │
-     │────────────────────────►│ (长轮询等待)              │
-     │                         │                          │
-     │                         │  GET /sign_in?receiver_2 │
-     │                         │◄─────────────────────────│
-     │                         │  200 OK (peer_id=2)      │
-     │                         │─────────────────────────►│
-     │                         │                          │
-     │  200 OK (通知新peer)    │                          │
-     │◄────────────────────────│                          │
-     │                         │                          │
-     │                         │  POST /message (Offer)   │
-     │                         │◄─────────────────────────│
-     │  200 OK (转发Offer)     │                          │
-     │◄────────────────────────│                          │
-     │                         │                          │
-     │  [创建 PeerConnection]  │                          │
-     │  [添加视频轨道]          │                          │
-     │  [创建 Answer]          │                          │
-     │                         │                          │
-     │  POST /message (Answer) │                          │
-     │────────────────────────►│                          │
-     │  200 OK                 │  200 OK (转发Answer)     │
-     │◄────────────────────────│─────────────────────────►│
-     │                         │                          │
-     │  [交换 ICE candidates]  │                          │
-     │◄───────────────────────►│◄────────────────────────►│
-     │                         │                          │
-     │  [H264 RTP 视频流]      │                          │
-     │────────────────────────────────────────────────────►│
-     │                         │                          │
-     │                         │     [Chrome 播放视频]     │
+[stream_client] BW | avail: 1200 kbps | RTT: 120 ms | bytes_sent: 123456
 ```
 
-## 关键源码说明
+## 弱网参数调整
 
-### frame_generator.h/cc
-- `FrameGenerator` 类：生成 320×240 YUV420p 帧
-- `SimpleFont` 类：5×7 位图字体，用于渲染时间戳
-- 每帧包含：深灰色背景、白色时间戳、绿色弹跳矩形
-
-### custom_video_source.h/cc
-- `CustomVideoSource` 类：继承 `webrtc::VideoTrackSource`
-- 在独立线程中以 30fps 生成帧
-- 实现 `AddOrUpdateSink`/`RemoveSink` 接口
-
-### stream_conductor.h/cc
-- `StreamConductor` 类：管理 WebRTC PeerConnection
-- 处理信令：SDP Offer/Answer 交换、ICE 候选交换
-- 使用 OpenH264 作为首选编码器
-- 作为 answerer（等待接收端发送 offer）
-
-### receiver.html
-- 纯 HTML/JavaScript 实现
-- 通过 XMLHttpRequest 与 `peerconnection_server` 通信
-- 创建 `RTCPeerConnection`，发送 offer，接收 answer
-- 接收 H264 视频流并在 `<video>` 标签中播放
-
-## 故障排除
-
-### 1. "Failed to create PeerConnectionFactory"
-- 确保 WebRTC 编译时启用了 H264：`rtc_use_h264=true`
-- 检查 OpenH264 库是否正确链接
-
-### 2. Chrome 无法连接
-- 确保 Ubuntu 防火墙允许 8888 端口
-- 确保使用正确的 Ubuntu IP 地址
-- 检查 Chrome 控制台（F12）是否有错误信息
-
-### 3. 视频无法播放
-- 检查 `stream_client` 日志是否有 "Video track added" 消息
-- 确保 Chrome 版本支持 H264 解码
-- 尝试在 Chrome 中访问 `chrome://webrtc-internals` 查看详细信息
-
-### 4. ICE 连接失败
-- 如果 Ubuntu 和 Windows 在不同子网，可能需要配置 STUN/TURN 服务器
-- 在 `stream_conductor.cc` 中添加 ICE 服务器配置
-
-### 5. Ubuntu 和 Windows 网络不通
-- 确保 VMware 网络设置为桥接模式（Bridged）或 NAT 端口转发
-- 在 Ubuntu 上运行 `ip addr` 查看 IP 地址
-- 在 Windows 上 `ping <Ubuntu_IP>` 测试连通性
-
-## 高级配置
-
-### 使用 STUN/TURN 服务器
-
-如果需要 NAT 穿透，在 `stream_conductor.cc` 中添加：
-
-```cpp
-webrtc::PeerConnectionInterface::IceServer stun_server;
-stun_server.uri = "stun:stun.l.google.com:19302";
-config.servers.push_back(stun_server);
-```
-
-在 `receiver.html` 中修改：
-```javascript
-var iceServers = [
-  { urls: 'stun:stun.l.google.com:19302' }
-];
-```
-
-### 修改视频参数
+编辑 `setup_network.sh` 顶部的可调参数：
 
 ```bash
-# 640x480 @ 24fps
-./stream_client --server=127.0.0.1 --port=8888 --id=stream_001 \
-                --width=640 --height=480 --fps=24
+BANDWIDTH="1mbit"       # 上行带宽
+RTT="200ms"             # 双向延迟
+LOSS="0%"               # 丢包率
 ```
 
-## 许可证
+修改后重新运行 `sudo ./setup_network.sh` 生效。
 
-BSD-style license，与 WebRTC 项目一致。
+## 技术要点
+
+### 纯视频架构
+
+使用自定义 `VideoOnlyMediaFactory` 替代 `EnableMedia()`，彻底绕开音频：
+- 不创建 WebRtcVoiceEngine
+- 不初始化 AudioDeviceModule（ADM）
+- 可在 sudo / network namespace 下正常运行
+
+### STUN 穿透
+
+namespace 内的 stream_client（IP: 10.0.0.2）无法被浏览器直接访问。通过 STUN 服务器发现外部 IP（宿主机 IP），生成 srflx ICE candidate，使浏览器能够建立连接。
+
+### 网络架构
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
+│  Browser    │────▶│  peerconnection  │◀────│ stream_client│
+│ (Windows)   │     │  server          │     │ (namespace)  │
+│             │     │  192.168.96.129  │     │ 10.0.0.2     │
+│             │     │  :8888           │     │              │
+│             │     └──────────────────┘     │              │
+│             │                               │              │
+│             │◀──── STUN (srflx) ───────────▶│              │
+│             │     192.168.96.129             │              │
+│             │                               │              │
+│             │◀═══ RTP/DTLS (media) ════════▶│              │
+└─────────────┘                               └─────────────┘
+```

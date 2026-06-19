@@ -53,7 +53,19 @@
     width: 100%; max-width: 640px; background: #000;
     border-radius: 8px; margin-top: 16px;
   }
-  .video-container { display: flex; justify-content: center; margin-top: 16px; }
+  .video-container { position: relative; display: flex; justify-content: center; margin-top: 16px; }
+  #delayOverlay {
+    position: absolute; top: 8px; left: 8px;
+    background: rgba(0,0,0,0.75); color: #00ff88;
+    font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;
+    padding: 8px 12px; border-radius: 6px;
+    line-height: 1.6; pointer-events: none;
+    min-width: 220px;
+  }
+  #delayOverlay .label { color: #aaa; }
+  #delayOverlay .value { color: #00ff88; font-weight: bold; }
+  #delayOverlay .value.warn { color: #ffaa00; }
+  #delayOverlay .value.bad  { color: #ff4444; }
   #log {
     margin-top: 16px; max-height: 300px; overflow-y: auto;
     font-family: 'Consolas', 'Monaco', monospace; font-size: 0.8em;
@@ -79,12 +91,17 @@
     <input type="text" id="streamId" value="stream_001">
   </div>
   <div class="form-row">
+    <label>STUN:</label>
+    <input type="text" id="stunServer" value="stun:192.168.96.129:3478" placeholder="stun:host:port (optional)">
+  </div>
+  <div class="form-row">
     <button id="connectBtn" onclick="connect()">Connect</button>
     <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
   </div>
   <div id="status" class="status info">Ready.</div>
   <div class="video-container">
     <video id="remoteVideo" autoplay playsinline></video>
+    <div id="delayOverlay">Waiting for stream...</div>
   </div>
   <div id="log"></div>
 </div>
@@ -100,6 +117,79 @@ var hangingGet = null;
 var request = null;
 
 var iceServers = [];
+
+// ============ Delay Measurement ============
+var delayHistory = [];        // last N delay values (ms)
+var DELAY_WINDOW = 30;        // sliding window size
+var statsTimer = null;
+var frameCount = 0;
+var lastStatsTime = 0;
+var lastFrameCount = 0;
+var lastBytesReceived = 0;
+var currentFps = 0;
+var actualBitrate = 0;       // kbps
+var availableBitrate = 0;    // kbps
+
+function delayClass(ms) {
+  if (ms < 100) return 'value';
+  if (ms < 300) return 'value warn';
+  return 'value bad';
+}
+
+function updateDelayOverlay(rttMs) {
+  var oneWayMs = rttMs / 2;
+  delayHistory.push(oneWayMs);
+  if (delayHistory.length > DELAY_WINDOW) delayHistory.shift();
+
+  var sum = 0;
+  for (var i = 0; i < delayHistory.length; i++) sum += delayHistory[i];
+  var avgMs = sum / delayHistory.length;
+
+  var minMs = Math.min.apply(null, delayHistory);
+  var maxMs = Math.max.apply(null, delayHistory);
+
+  var el = document.getElementById('delayOverlay');
+  el.innerHTML =
+    '<div><span class="label">RTT: </span><span class="' + delayClass(rttMs) + '">' + rttMs.toFixed(1) + ' ms</span></div>' +
+    '<div><span class="label">One-way delay: </span><span class="' + delayClass(oneWayMs) + '">' + oneWayMs.toFixed(1) + ' ms</span></div>' +
+    '<div><span class="label">Avg(' + delayHistory.length + '): </span><span class="' + delayClass(avgMs) + '">' + avgMs.toFixed(1) + ' ms</span></div>' +
+    '<div><span class="label">Min: </span><span class="value">' + minMs.toFixed(1) + ' ms</span>' +
+    ' <span class="label">Max: </span><span class="value">' + maxMs.toFixed(1) + ' ms</span></div>' +
+    '<div><span class="label">Actual BW: </span><span class="value">' + actualBitrate.toFixed(0) + ' kbps</span></div>' +
+    '<div><span class="label">Avail BW: </span><span class="value">' + availableBitrate.toFixed(0) + ' kbps</span></div>' +
+    '<div><span class="label">Frames: </span><span class="value">' + frameCount + '</span>' +
+    ' <span class="label">FPS: </span><span class="value">' + currentFps + '</span></div>';
+}
+
+function collectStats() {
+  if (!pc) return;
+  var now = Date.now();
+  pc.getStats(null).then(function(stats) {
+    stats.forEach(function(report) {
+      if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+        if (report.currentRoundTripTime !== undefined) {
+          updateDelayOverlay(report.currentRoundTripTime * 1000);
+        }
+        if (report.availableOutgoingBitrate !== undefined) {
+          availableBitrate = report.availableOutgoingBitrate / 1000;
+        }
+      }
+      if (report.type === 'inbound-rtp' && report.kind === 'video') {
+        frameCount = report.framesDecoded || 0;
+        var bytesNow = report.bytesReceived || 0;
+        if (lastStatsTime > 0) {
+          var elapsed = (now - lastStatsTime) / 1000;
+          var framesDiff = frameCount - lastFrameCount;
+          currentFps = Math.round(framesDiff / elapsed);
+          actualBitrate = ((bytesNow - lastBytesReceived) * 8) / elapsed / 1000;
+        }
+        lastFrameCount = frameCount;
+        lastBytesReceived = bytesNow;
+        lastStatsTime = now;
+      }
+    });
+  });
+}
 
 function log(msg, cls) {
   var el = document.getElementById('log');
@@ -291,12 +381,13 @@ function startCall() {
 
   log('>>> Starting call to peer ' + peerId + ' (' + streamId + ')', 'info');
   setStatus('Connecting to ' + streamId + '...', 'info');
+  log('ICE servers: ' + JSON.stringify(iceServers), 'info');
 
   pc = new RTCPeerConnection({ iceServers: iceServers });
 
   pc.onicecandidate = function(e) {
     if (e.candidate) {
-      log('ICE candidate generated', 'send');
+      log('ICE candidate: ' + e.candidate.candidate, 'send');
       sendToPeer(peerId, JSON.stringify(e.candidate));
     } else {
       log('All ICE candidates sent', 'send');
@@ -308,6 +399,14 @@ function startCall() {
     if (e.streams && e.streams[0]) {
       document.getElementById('remoteVideo').srcObject = e.streams[0];
       setStatus('Streaming!', 'connected');
+      // Start collecting stats for delay measurement
+      if (statsTimer) clearInterval(statsTimer);
+      delayHistory = [];
+      frameCount = 0;
+      lastStatsTime = 0;
+      lastFrameCount = 0;
+      currentFps = 0;
+      statsTimer = setInterval(collectStats, 1000);
     }
   };
 
@@ -350,6 +449,16 @@ function connect() {
   streamId = document.getElementById('streamId').value.trim();
   if (!server || !streamId) { alert('Please fill in both fields'); return; }
 
+  // Build ICE servers from STUN input
+  iceServers = [];
+  var stunUri = document.getElementById('stunServer').value.trim();
+  if (stunUri) {
+    iceServers.push({ urls: stunUri });
+    log('Using STUN server: ' + stunUri, 'info');
+  } else {
+    log('No STUN server configured (direct connection only)', 'info');
+  }
+
   document.getElementById('connectBtn').disabled = true;
   document.getElementById('disconnectBtn').disabled = false;
   setStatus('Connecting to signaling server...', 'info');
@@ -359,6 +468,7 @@ function connect() {
 
 function disconnect() {
   log('Disconnecting...', 'info');
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   if (pc) { pc.close(); pc = null; }
   if (hangingGet) { hangingGet.abort(); hangingGet = null; }
   if (request) { request.abort(); request = null; }

@@ -23,7 +23,6 @@
 #include "api/jsep.h"
 #include "api/peer_connection_interface.h"
 #include "api/scoped_refptr.h"
-#include "api/scoped_refptr.h"
 #include "examples/peerconnection/stream_client/peer_connection_client.h"
 #include "examples/peerconnection/stream_client/custom_video_source.h"
 #include "rtc_base/thread.h"
@@ -47,6 +46,9 @@ class StreamConductor : public webrtc::PeerConnectionObserver,
 
   // Connect to the signaling server.
   void ConnectToServer(const std::string& server, int port);
+
+  // Set STUN server URI for ICE candidate gathering (e.g. "stun:192.168.96.129:3478")
+  void SetStunServer(const std::string& uri);
 
   // Disconnect and cleanup.
   void Close();
@@ -101,6 +103,7 @@ class StreamConductor : public webrtc::PeerConnectionObserver,
 
   int peer_id_;
   std::string server_;
+  std::string stun_server_;  // STUN server URI for ICE gathering
 
   // Message queue for ICE candidates that arrive before remote description is set
   bool remote_description_set_;

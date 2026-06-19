@@ -54,6 +54,10 @@ ABSL_FLAG(int, height, 240,
 ABSL_FLAG(int, fps, 30,
           "Video frame rate (default: 30)");
 
+ABSL_FLAG(std::string, stun, "",
+          "STUN server URI for ICE candidate gathering (e.g. stun:192.168.96.129:3478). "
+          "Required when running inside a network namespace.");
+
 ABSL_FLAG(std::string, force_fieldtrials, "",
           "Field trials for experimental features");
 
@@ -75,7 +79,9 @@ int main(int argc, char* argv[]) {
       "and streams them via peerconnection_server to a web browser receiver.\n"
       "\n"
       "Example:\n"
-      "  ./stream_client --server=192.168.1.100 --port=8888 --id=stream_001");
+      "  ./stream_client --server=192.168.1.100 --port=8888 --id=stream_001\n"
+      "  ./stream_client --server=192.168.1.100 --port=8888 --id=stream_001 \\\n"
+      "                  --stun=stun:192.168.1.100:3478");
 
   absl::ParseCommandLine(argc, argv);
 
@@ -90,6 +96,7 @@ int main(int argc, char* argv[]) {
   int width = absl::GetFlag(FLAGS_width);
   int height = absl::GetFlag(FLAGS_height);
   int fps = absl::GetFlag(FLAGS_fps);
+  std::string stun = absl::GetFlag(FLAGS_stun);
 
   if (server.empty()) {
     fprintf(stderr, "Error: server address is required\n");
@@ -117,6 +124,9 @@ int main(int argc, char* argv[]) {
   printf("Stream ID:  %s\n", stream_id.c_str());
   printf("Resolution: %dx%d @ %dfps\n", width, height, fps);
   printf("Codec:      H264 (OpenH264)\n");
+  if (!stun.empty()) {
+    printf("STUN:       %s\n", stun.c_str());
+  }
   printf("\nPress Ctrl+C to stop.\n\n");
 
   // Initialize WebRTC
@@ -135,6 +145,11 @@ int main(int argc, char* argv[]) {
   PeerConnectionClient client;
   auto conductor = webrtc::make_ref_counted<stream_client::StreamConductor>(
       env, &client, stream_id, width, height, fps);
+
+  // Set STUN server if provided
+  if (!stun.empty()) {
+    conductor.get()->SetStunServer(stun);
+  }
 
   // Initialize conductor
   if (!conductor.get()->Initialize()) {

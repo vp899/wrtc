@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <chrono>
 
 #include "api/video/i420_buffer.h"
 #include "rtc_base/logging.h"
@@ -73,6 +75,21 @@ void FrameGenerator::SetCirclePosition(int x, int y) {
   // Clamp to keep circle within frame bounds
   circle_x_ = std::max(circle_radius_, std::min(width_ - circle_radius_, x));
   circle_y_ = std::max(circle_radius_, std::min(height_ - circle_radius_, y));
+}
+
+std::string FrameGenerator::FormatWallClock() {
+  using namespace std::chrono;
+  auto now = system_clock::now();
+  auto ms_part = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+  time_t tt = system_clock::to_time_t(now);
+  struct tm ltm;
+  localtime_r(&tt, &ltm);
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d:%03d",
+           ltm.tm_hour, ltm.tm_min, ltm.tm_sec,
+           static_cast<int>(ms_part.count()));
+  return std::string(buf);
 }
 
 std::string FrameGenerator::FormatTimestamp(int64_t elapsed_ms) {
@@ -216,9 +233,13 @@ webrtc::scoped_refptr<webrtc::I420Buffer> FrameGenerator::GenerateFrame(
 
   ClearFrame(y_plane, u_plane, v_plane, y_stride, uv_stride);
 
-  // Draw timestamp
+  // Draw elapsed timestamp (line 1)
   std::string timestamp = FormatTimestamp(elapsed_ms);
   DrawString(y_plane, y_stride, 10, 10, timestamp, 235);
+
+  // Draw wall-clock time (line 2) — used for frame-level delay measurement
+  std::string wallclock = FormatWallClock();
+  DrawString(y_plane, y_stride, 10, 20, wallclock, 235);
 
   // Draw draggable red circle (above the square)
   // Red in YUV: Y=76, U=84, V=255

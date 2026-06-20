@@ -14,6 +14,11 @@
 #include <utility>
 #include <vector>
 #include <unistd.h>
+#include <thread>
+#include <atomic>
+#include <ctime>
+#include <chrono>
+#include <algorithm>
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
@@ -24,6 +29,7 @@
 #include "api/jsep.h"
 #include "api/make_ref_counted.h"
 #include "api/peer_connection_interface.h"
+#include "api/rtp_parameters.h"
 #include "api/rtc_error.h"
 #include "api/scoped_refptr.h"
 #include "api/video_codecs/sdp_video_format.h"
@@ -54,6 +60,9 @@
 #include "rtc_base/time_utils.h"
 
 namespace stream_client {
+
+// Shared target bitrate for source-level adaptation (read by custom_video_source.cc)
+std::atomic<int> g_target_kbps{0};
 
 namespace {
 const char kCandidateSdpMidName[] = "sdpMid";
@@ -94,13 +103,11 @@ class BandwidthStatsObserver : public webrtc::RTCStatsCollectorCallback {
             bytes_sent = *cp.bytes_sent;
         }
       }
-      if (std::strcmp(stat.type(), "outbound-rtp") == 0) {
-        // Use outbound-rtp bytes_sent as actual sent data
-      }
     }
 
     double avail_kbps = available_bw / 1000.0;
     double rtt_ms = rtt * 1000.0;
+    g_target_kbps.store(static_cast<int>(avail_kbps));
 
     printf("[stream_client] BW | avail: %.0f kbps | RTT: %.0f ms | bytes_sent: %llu\n",
            avail_kbps, rtt_ms, (unsigned long long)bytes_sent);
@@ -357,6 +364,12 @@ bool StreamConductor::CreatePeerConnection() {
 }
 
 void StreamConductor::DeletePeerConnection() {
+  // Stop latency ping timer
+  latency_ping_running_ = false;
+  if (latency_ping_thread_.joinable()) {
+    latency_ping_thread_.join();
+  }
+
   if (data_channel_) {
     data_channel_->UnregisterObserver();
     data_channel_ = nullptr;
@@ -371,13 +384,74 @@ void StreamConductor::DeletePeerConnection() {
 
 void StreamConductor::OnDataChannel(
     webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) {
-  printf("[stream_client] DataChannel received: %s\n", channel->label().c_str()); fflush(stdout);
+  printf("[stream_client] DataChannel received: %s (id=%d)\n",
+         channel->label().c_str(), channel->id()); fflush(stdout);
   data_channel_ = channel;
   data_channel_->RegisterObserver(this);
+
+  // Start latency ping timer — sends wall-clock time via DataChannel at 1fps
+  // so the browser can measure end-to-end frame delay.
+  latency_ping_running_ = true;
+  latency_ping_thread_ = std::thread([this]() {
+    while (latency_ping_running_) {
+      usleep(1000000);  // 1 second
+      if (!latency_ping_running_ || !data_channel_ ||
+          data_channel_->state() != webrtc::DataChannelInterface::kOpen) {
+        continue;
+      }
+      using namespace std::chrono;
+      auto now = system_clock::now();
+      auto ms_part = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+      time_t tt = system_clock::to_time_t(now);
+      struct tm ltm;
+      localtime_r(&tt, &ltm);
+
+      // Also compute elapsed_ms for clock-skew-free delay measurement
+      auto elapsed = duration_cast<milliseconds>(now.time_since_epoch()).count();
+
+      char buf[48];
+      snprintf(buf, sizeof(buf), "PING:%02d:%02d:%02d:%03d,%lld",
+               ltm.tm_hour, ltm.tm_min, ltm.tm_sec,
+               static_cast<int>(ms_part.count()),
+               static_cast<long long>(elapsed));
+      webrtc::DataBuffer dp{std::string(buf)};
+      data_channel_->Send(dp);
+    }
+  });
+  printf("[stream_client] Latency ping timer started (1fps)\n"); fflush(stdout);
 }
 
 void StreamConductor::OnMessage(const webrtc::DataBuffer& buffer) {
   std::string msg(buffer.data.data<char>(), buffer.data.size());
+
+  // Handle BW feedback from receiver: "BW:123"
+  if (msg.size() > 3 && msg[0] == 'B' && msg[1] == 'W' && msg[2] == ':') {
+    int recv_kbps = std::atoi(msg.c_str() + 3);
+    if (recv_kbps > 0 && peer_connection_) {
+      auto senders = peer_connection_->GetSenders();
+      for (auto& sender : senders) {
+        if (sender->track() && sender->track()->id() == kVideoLabel) {
+          auto params = sender->GetParameters();
+          if (!params.encodings.empty()) {
+            // Set max bitrate to 1.2x what receiver is actually getting
+            // This prevents encoder from producing more than network can carry
+            int new_max = std::max(30000, static_cast<int>(recv_kbps * 1200));
+            if (new_max != params.encodings[0].max_bitrate_bps) {
+              params.encodings[0].max_bitrate_bps = new_max;
+              sender->SetParameters(params);
+              printf("[stream_client] BW feedback: recv=%dkbps, set max=%dkbps\n",
+                     recv_kbps, new_max / 1000);
+              fflush(stdout);
+            }
+          }
+          break;
+        }
+      }
+    }
+    return;
+  }
+
+  // Handle circle position: "x,y"
   size_t comma = msg.find(',');
   if (comma != std::string::npos) {
     int x = std::atoi(msg.c_str());
@@ -402,6 +476,27 @@ void StreamConductor::AddVideoTrack() {
     RTC_LOG(LS_ERROR) << "Failed to add video track: "
                       << result.error().message();
     return;
+  }
+
+  // Set encoder max bitrate via RtpSender parameters
+  auto senders = peer_connection_->GetSenders();
+  for (auto& sender : senders) {
+    if (sender->track() && sender->track()->id() == kVideoLabel) {
+      auto params = sender->GetParameters();
+      if (!params.encodings.empty()) {
+        params.encodings[0].max_bitrate_bps = 200000;   // 200kbps max (conservative for 320x240)
+        params.encodings[0].min_bitrate_bps = 10000;    // 10kbps min
+        params.encodings[0].max_framerate = fps_;
+        auto err = sender->SetParameters(params);
+        if (err.ok()) {
+          printf("[stream_client] Encoder bitrate: min=30kbps max=500kbps\n");
+        } else {
+          printf("[stream_client] SetParameters failed: %s\n", err.message());
+        }
+        fflush(stdout);
+      }
+      break;
+    }
   }
 
   video_source_->Start();

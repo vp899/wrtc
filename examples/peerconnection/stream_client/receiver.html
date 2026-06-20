@@ -118,9 +118,18 @@ var request = null;
 
 var iceServers = [];
 
-// ============ Delay Measurement ============
-var delayHistory = [];        // last N delay values (ms)
-var DELAY_WINDOW = 30;        // sliding window size
+// ============ Frame-Level Delay Measurement ============
+// Two mechanisms:
+// 1. PING via DataChannel: sender sends PING:HH:MM:SS:mmm,elapsedMs at 1fps.
+//    Used to establish clock offset between sender elapsed_ms and local Date.now().
+// 2. requestVideoFrameCallback: fires for each ACTUALLY DISPLAYED video frame.
+//    Reads the frame's RTP timestamp and maps it to sender time via PING calibration.
+//    This captures true end-to-end delay including encode + network + decode + render,
+//    and correctly reflects packet loss impact (delay grows when frames are late).
+
+var frameDelayHistory = [];   // last N frame delay values (ms)
+var rttHistory = [];          // last N RTT values (ms)
+var DELAY_WINDOW = 30;
 var statsTimer = null;
 var frameCount = 0;
 var lastStatsTime = 0;
@@ -128,7 +137,25 @@ var lastFrameCount = 0;
 var lastBytesReceived = 0;
 var currentFps = 0;
 var actualBitrate = 0;       // kbps
-var availableBitrate = 0;    // kbps
+var rttMs = 0;
+
+// PING clock calibration
+var pingCount = 0;
+var firstSenderElapsed = 0;
+var firstLocalElapsed = 0;
+
+// RTP timestamp → sender elapsed_ms mapping
+// Linear: senderMs = rtpMs * rtpToSenderRate + rtpToSenderOffset
+var refCalibrated = false;
+var refLocalMs = 0;           // Date.now() at first PING
+var refRtpTicks = 0;          // RTP timestamp (90kHz ticks) at first PING
+var lastRtpTicks = 0;         // most recent RTP ticks from rVFC
+
+// Pending PING data for rVFC to consume
+var pendingPingSenderMs = -1;
+var pendingPingLocalMs = -1;
+var rvfcFrameCount = 0;
+var rvfcStarted = false;
 
 function delayClass(ms) {
   if (ms < 100) return 'value';
@@ -136,29 +163,96 @@ function delayClass(ms) {
   return 'value bad';
 }
 
-function updateDelayOverlay(rttMs) {
-  var oneWayMs = rttMs / 2;
-  delayHistory.push(oneWayMs);
-  if (delayHistory.length > DELAY_WINDOW) delayHistory.shift();
+function handlePingMessage(msg) {
+  // Parse PING:HH:MM:SS:mmm,elapsedMs
+  if (msg.indexOf('PING:') !== 0) return false;
+  var payload = msg.substring(5);
+  var comma = payload.indexOf(',');
+  if (comma < 0) return false;
 
-  var sum = 0;
-  for (var i = 0; i < delayHistory.length; i++) sum += delayHistory[i];
-  var avgMs = sum / delayHistory.length;
+  var senderElapsed = parseInt(payload.substring(comma + 1));
+  if (isNaN(senderElapsed)) return false;
 
-  var minMs = Math.min.apply(null, delayHistory);
-  var maxMs = Math.max.apply(null, delayHistory);
+  var localElapsed = Date.now();
+  pingCount++;
 
-  var el = document.getElementById('delayOverlay');
-  el.innerHTML =
-    '<div><span class="label">RTT: </span><span class="' + delayClass(rttMs) + '">' + rttMs.toFixed(1) + ' ms</span></div>' +
-    '<div><span class="label">One-way delay: </span><span class="' + delayClass(oneWayMs) + '">' + oneWayMs.toFixed(1) + ' ms</span></div>' +
-    '<div><span class="label">Avg(' + delayHistory.length + '): </span><span class="' + delayClass(avgMs) + '">' + avgMs.toFixed(1) + ' ms</span></div>' +
-    '<div><span class="label">Min: </span><span class="value">' + minMs.toFixed(1) + ' ms</span>' +
-    ' <span class="label">Max: </span><span class="value">' + maxMs.toFixed(1) + ' ms</span></div>' +
-    '<div><span class="label">Actual BW: </span><span class="value">' + actualBitrate.toFixed(0) + ' kbps</span></div>' +
-    '<div><span class="label">Avail BW: </span><span class="value">' + availableBitrate.toFixed(0) + ' kbps</span></div>' +
-    '<div><span class="label">Frames: </span><span class="value">' + frameCount + '</span>' +
-    ' <span class="label">FPS: </span><span class="value">' + currentFps + '</span></div>';
+  if (pingCount === 1) {
+    firstSenderElapsed = senderElapsed;
+    firstLocalElapsed = localElapsed;
+  }
+
+  // Store for rVFC to consume (it will sample the current RTP timestamp)
+  pendingPingSenderMs = senderElapsed;
+  pendingPingLocalMs = localElapsed;
+
+  // Fallback: if rVFC hasn't produced results after 5 pings, use PING-based delay
+  if (pingCount > 5 && rvfcFrameCount === 0) {
+    var senderElapsedSinceRef = senderElapsed - firstSenderElapsed;
+    var localElapsedSinceRef = localElapsed - firstLocalElapsed;
+    var delay = localElapsedSinceRef - senderElapsedSinceRef;
+    if (delay >= -50 && delay <= 60000) {
+      frameDelayHistory.push(delay);
+      if (frameDelayHistory.length > DELAY_WINDOW) frameDelayHistory.shift();
+    }
+  }
+
+  return true;
+}
+
+function startRvfcLoop() {
+  console.log('[RVFC] startRvfcLoop called');
+  try {
+    var video = document.getElementById('remoteVideo');
+    console.log('[RVFC] video element: ' + (video ? 'found' : 'NOT FOUND'));
+    if (!video) return;
+    console.log('[RVFC] requestVideoFrameCallback: ' + (typeof video.requestVideoFrameCallback));
+    if (typeof video.requestVideoFrameCallback !== 'function') {
+      console.log('[RVFC] NOT SUPPORTED, will use PING fallback after 5s');
+      return;
+    }
+    rvfcStarted = true;
+    console.log('[RVFC] registering callback...');
+
+    function onFrame(now, metadata) {
+      try {
+        // Process every 2nd frame to reduce CPU (15fps instead of 30fps)
+        rvfcFrameCount++;
+        if (metadata.rtpTimestamp !== undefined && rvfcFrameCount % 2 === 1) {
+          var rtpTicks = metadata.rtpTimestamp;  // 90kHz RTP clock ticks
+          lastRtpTicks = rtpTicks;
+          if (rvfcFrameCount <= 6) console.log('[RVFC] frame #' + rvfcFrameCount + ' rtpTicks=' + rtpTicks);
+
+          // Calibrate: use the first PING where we have an RTP sample
+          if (!refCalibrated && pendingPingLocalMs > 0) {
+            refLocalMs = pendingPingLocalMs;
+            refRtpTicks = rtpTicks;
+            refCalibrated = true;
+            console.log('[PING] calibrated: refLocal=' + refLocalMs + ' refRtpTicks=' + refRtpTicks);
+          }
+
+          // Calculate delay if calibrated
+          if (refCalibrated) {
+            // RTP ticks elapsed -> ms: ticksDelta / 90
+            var rtpElapsedMs = (rtpTicks - refRtpTicks) / 90.0;
+            var localElapsedMs = Date.now() - refLocalMs;
+            // Delay = local elapsed - RTP elapsed (includes encode+network+decode+render)
+            var delay = localElapsedMs - rtpElapsedMs;
+
+            if (delay >= -50 && delay <= 60000) {
+              frameDelayHistory.push(delay);
+              if (frameDelayHistory.length > DELAY_WINDOW) frameDelayHistory.shift();
+            }
+          }
+        }
+
+        // Schedule next frame callback
+        video.requestVideoFrameCallback(onFrame);
+      } catch (e) { console.log('[RVFC] onFrame error: ' + e); video.requestVideoFrameCallback(onFrame); }
+    }
+
+  try { video.requestVideoFrameCallback(onFrame); } catch (e) { console.log('[RVFC] register error: ' + e); }
+  console.log('[RVFC] callback registered');
+} catch (e) { console.log('[RVFC] startRvfcLoop error: ' + e); }
 }
 
 function collectStats() {
@@ -168,10 +262,9 @@ function collectStats() {
     stats.forEach(function(report) {
       if (report.type === 'candidate-pair' && report.state === 'succeeded') {
         if (report.currentRoundTripTime !== undefined) {
-          updateDelayOverlay(report.currentRoundTripTime * 1000);
-        }
-        if (report.availableOutgoingBitrate !== undefined) {
-          availableBitrate = report.availableOutgoingBitrate / 1000;
+          rttMs = report.currentRoundTripTime * 1000;
+          rttHistory.push(rttMs);
+          if (rttHistory.length > DELAY_WINDOW) rttHistory.shift();
         }
       }
       if (report.type === 'inbound-rtp' && report.kind === 'video') {
@@ -188,7 +281,45 @@ function collectStats() {
         lastStatsTime = now;
       }
     });
+    updateDelayOverlay();
   });
+}
+
+function updateDelayOverlay() {
+  var el = document.getElementById('delayOverlay');
+  var html = '';
+
+  // Frame-level delay (from PING timestamp)
+  if (frameDelayHistory.length > 0) {
+    var sum = 0;
+    for (var i = 0; i < frameDelayHistory.length; i++) sum += frameDelayHistory[i];
+    var avgFd = sum / frameDelayHistory.length;
+    var minFd = Math.min.apply(null, frameDelayHistory);
+    var maxFd = Math.max.apply(null, frameDelayHistory);
+    var lastFd = frameDelayHistory[frameDelayHistory.length - 1];
+    html += '<div><span class="label">Frame delay: </span><span class="' + delayClass(lastFd) + '">' + lastFd.toFixed(0) + ' ms</span></div>';
+    html += '<div><span class="label">Avg(' + frameDelayHistory.length + '): </span><span class="' + delayClass(avgFd) + '">' + avgFd.toFixed(0) + ' ms</span>';
+    html += ' <span class="label">Min: </span><span class="value">' + minFd.toFixed(0) + '</span>';
+    html += ' <span class="label">Max: </span><span class="value">' + maxFd.toFixed(0) + '</span></div>';
+  } else {
+    html += '<div><span class="label">Frame delay: </span><span class="value">waiting...</span></div>';
+  }
+
+  // Packet-level RTT (from ICE candidate-pair)
+  if (rttHistory.length > 0) {
+    var lastRtt = rttHistory[rttHistory.length - 1];
+    html += '<div><span class="label">RTT (packet): </span><span class="' + delayClass(lastRtt) + '">' + lastRtt.toFixed(1) + ' ms</span></div>';
+  }
+
+  // Bandwidth + FPS
+  html += '<div><span class="label">Recv BW: </span><span class="value">' + actualBitrate.toFixed(0) + ' kbps</span>';
+  html += ' <span class="label">Frames: </span><span class="value">' + frameCount + '</span></div>';
+  html += '<div><span class="label">FPS: </span><span class="value">' + currentFps + '</span>';
+  html += ' <span class="label">DC sent: </span><span class="value">' + dcMsgSent + '</span>';
+  if (dragChannel) html += ' <span class="label">DC: </span><span class="value">' + dragChannel.readyState + '</span>';
+  html += '</div>';
+
+  el.innerHTML = html;
 }
 
 function log(msg, cls) {
@@ -399,14 +530,26 @@ function startCall() {
     if (e.streams && e.streams[0]) {
       document.getElementById('remoteVideo').srcObject = e.streams[0];
       setStatus('Streaming!', 'connected');
-      // Start collecting stats for delay measurement
+      // Start stats collection
       if (statsTimer) clearInterval(statsTimer);
-      delayHistory = [];
+      frameDelayHistory = [];
+      rttHistory = [];
       frameCount = 0;
       lastStatsTime = 0;
       lastFrameCount = 0;
       currentFps = 0;
-      statsTimer = setInterval(collectStats, 1000);
+      rttMs = 0;
+      pingCount = 0;
+      refCalibrated = false;
+      refLocalMs = 0;
+      refRtpTicks = 0;
+      lastRtpTicks = 0;
+      pendingPingSenderMs = -1;
+      rvfcFrameCount = 0;
+      rvfcStarted = false;
+      statsTimer = setInterval(collectStats, 2000);
+      // Start requestVideoFrameCallback loop for true frame-level delay
+      startRvfcLoop();
     }
   };
 
@@ -424,14 +567,19 @@ function startCall() {
   // Add transceiver to receive video
   pc.addTransceiver('video', { direction: 'recvonly' });
 
-  // DataChannel for remote control (will be created by sender,
-  // but we also create one to ensure it exists)
-  var dc = pc.createDataChannel('control');
-  dc.onopen = function() { log('DataChannel opened', 'recv'); setupMouseDrag(dc); };
+  // DataChannel for remote control — unreliable (unordered, no retransmit)
+  // for low-latency position updates even under packet loss.
+  var dc = pc.createDataChannel('control', {
+    ordered: false,
+    maxRetransmits: 0
+  });
+  dc.onopen = function() { log('DataChannel opened (unreliable, 20fps)', 'recv'); setupMouseDrag(dc); };
   dc.onclose = function() { log('DataChannel closed', 'info'); };
+  dc.onmessage = function(e) { handlePingMessage(e.data); };
 
   pc.ondatachannel = function(e) {
     log('DataChannel received: ' + e.channel.label, 'recv');
+    handleSenderDataChannel(e.channel);
     e.channel.onopen = function() { log('DataChannel opened', 'recv'); setupMouseDrag(e.channel); };
   };
 
@@ -450,36 +598,38 @@ function startCall() {
     });
 }
 
-// ============ Mouse Drag Control ============
+// ============ Mouse Drag Control (50fps unreliable) ============
 var dragChannel = null;
 var isDragging = false;
+var lastMouseX = 160;  // center default
+var lastMouseY = 120;
+var dcSendTimer = null;
+var dcMsgSent = 0;
 
 function setupMouseDrag(channel) {
   dragChannel = channel;
   var video = document.getElementById('remoteVideo');
 
-  function sendPos(e) {
-    if (!dragChannel || dragChannel.readyState !== 'open') return;
+  // Map mouse position to 320x240 video coordinates and store
+  function updateMousePos(e) {
     var rect = video.getBoundingClientRect();
-    // Map mouse position to 320x240 video coordinates
     var scaleX = 320 / rect.width;
     var scaleY = 240 / rect.height;
-    var vx = Math.round((e.clientX - rect.left) * scaleX);
-    var vy = Math.round((e.clientY - rect.top) * scaleY);
-    vx = Math.max(0, Math.min(320, vx));
-    vy = Math.max(0, Math.min(240, vy));
-    dragChannel.send(vx + ',' + vy);
+    lastMouseX = Math.round((e.clientX - rect.left) * scaleX);
+    lastMouseY = Math.round((e.clientY - rect.top) * scaleY);
+    lastMouseX = Math.max(0, Math.min(320, lastMouseX));
+    lastMouseY = Math.max(0, Math.min(240, lastMouseY));
   }
 
   video.addEventListener('mousedown', function(e) {
     isDragging = true;
-    sendPos(e);
+    updateMousePos(e);
     e.preventDefault();
   });
 
   document.addEventListener('mousemove', function(e) {
     if (!isDragging) return;
-    sendPos(e);
+    updateMousePos(e);
     e.preventDefault();
   });
 
@@ -487,7 +637,48 @@ function setupMouseDrag(channel) {
     isDragging = false;
   });
 
-  log('Mouse drag control enabled (drag circle to move it)', 'info');
+  // 50fps send loop — sends latest position every 20ms
+  // Uses unreliable DataChannel (maxRetransmits=0, unordered)
+  // so dropped packets are simply skipped, keeping latency low.
+  if (dcSendTimer) clearInterval(dcSendTimer);
+  dcMsgSent = 0;
+  dcSendTimer = setInterval(function() {
+    if (!dragChannel || dragChannel.readyState !== 'open') return;
+    if (!isDragging) return;
+    try {
+      dragChannel.send(lastMouseX + ',' + lastMouseY);
+      dcMsgSent++;
+    } catch (e) {}
+  }, 50);  // 50ms = 20fps
+
+  log('Mouse drag control enabled (50fps unreliable DataChannel)', 'info');
+}
+
+// ============ Receiver BW Feedback ============
+// Send actual received bitrate to sender every 2s via DataChannel
+var feedbackTimer = null;
+
+function startBwFeedback() {
+  if (feedbackTimer) clearInterval(feedbackTimer);
+  feedbackTimer = setInterval(function() {
+    if (!dragChannel || dragChannel.readyState !== 'open') return;
+    if (actualBitrate > 0) {
+      try {
+        dragChannel.send('BW:' + Math.round(actualBitrate));
+      } catch (e) {}
+    }
+  }, 2000);
+}
+
+function handleSenderDataChannel(channel) {
+  // Sender-created DataChannel — use for BW feedback
+  channel.onmessage = function(e) {
+    if (typeof e.data === 'string') {
+      handlePingMessage(e.data);
+    }
+  };
+  dragChannel = channel;
+  startBwFeedback();
 }
 
 // ============ UI ============
@@ -520,6 +711,7 @@ function connect() {
 function disconnect() {
   log('Disconnecting...', 'info');
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  if (dcSendTimer) { clearInterval(dcSendTimer); dcSendTimer = null; }
   if (pc) { pc.close(); pc = null; }
   if (hangingGet) { hangingGet.abort(); hangingGet = null; }
   if (request) { request.abort(); request = null; }

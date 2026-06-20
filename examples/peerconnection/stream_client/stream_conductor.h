@@ -18,6 +18,8 @@
 #include <deque>
 #include <memory>
 #include <string>
+#include <thread>
+#include <atomic>
 
 #include "api/data_channel_interface.h"
 #include "api/environment/environment.h"
@@ -125,6 +127,10 @@ class StreamConductor : public webrtc::PeerConnectionObserver,
 
   std::deque<std::string*> pending_messages_;
   bool stats_running_ = false;
+
+  // Latency ping timer
+  std::thread latency_ping_thread_;
+  std::atomic<bool> latency_ping_running_{false};
 };
 
 }  // namespace stream_client

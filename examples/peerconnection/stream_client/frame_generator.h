@@ -44,6 +44,7 @@ class FrameGenerator {
   void DrawString(uint8_t* y_plane, int stride, int x, int y,
                   const std::string& text, uint8_t color);
   std::string FormatTimestamp(int64_t elapsed_ms);
+  std::string FormatWallClock();
   void DrawRect(uint8_t* y_plane, uint8_t* u_plane, uint8_t* v_plane,
                 int y_stride, int uv_stride, int x, int y, int w, int h,
                 uint8_t y_val, uint8_t u_val, uint8_t v_val);
